@@ -9,7 +9,25 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <DNSServer.h> // Thư viện để làm Captive Portal
 
+Preferences preferences;
+WebServer server(80);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+// Các biến cấu hình MQTT thay thế cho hardcode
+String mqtt_server = "";
+int mqtt_port;
+String mqtt_client_id = "";
+String mqtt_username = "";
+String mqtt_password = "";
+String mqtt_topic = "";
+
+bool isAPMode = false;
 SemaphoreHandle_t i2cMutex;
 // ===== OLED SSD1306 + RTC PCF8563 =====
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE); // Khởi tạo đối tượng màn hình OLED SSD1306 sử dụng giao tiếp I2C phần cứng
@@ -29,11 +47,11 @@ bool isDisplayOn = false; // Cờ kiểm tra xem màn hình OLED có đang bật
 #define SIM_BAUD 115200 // Tốc độ baud cho giao tiếp với SIM7020
 #define APN "internet" // Tên APN (Access Point Name) cho kết nối mạng
 // ===== MQTT CONFIG =====
-const char* MQTT_SERVER = "test.mosquitto.org"; // Địa chỉ server MQTT
-const int MQTT_PORT = 1883; // Cổng MQTT
-const char* MQTT_CLIENT_ID = "nb_iot_cam_device"; // ID client MQTT
-const char* MQTT_USERNAME = ""; // Tên đăng nhập MQTT (rỗng nếu không cần)
-const char* MQTT_TOPIC = "nb-iot/image/upload"; // Topic MQTT để publish ảnh
+// const char* MQTT_SERVER = "test.mosquitto.org"; // Địa chỉ server MQTT
+// const int MQTT_PORT = 1883; // Cổng MQTT
+// const char* MQTT_CLIENT_ID = "nb_iot_cam_device"; // ID client MQTT
+// const char* MQTT_USERNAME = ""; // Tên đăng nhập MQTT (rỗng nếu không cần)
+// const char* MQTT_TOPIC = "nb-iot/image/upload"; // Topic MQTT để publish ảnh
 const unsigned long SEND_INTERVAL_MS = 300000UL; // Khoảng thời gian gửi ảnh (5 phút = 300000 ms)
 const unsigned long SLEEP_INTERVAL_MS = 30000UL; // Khoảng thời gian ngủ mặc định (30 giây, nhưng sẽ được điều chỉnh)
 HardwareSerial sim(1); // Khởi tạo đối tượng Serial cho SIM7020 (sử dụng UART1)
@@ -331,7 +349,8 @@ bool mqttConnect() { // Hàm kết nối MQTT
   delay(3000); //  Cho module ổn định socket NB-IoT
   // ===== CMQNEW với retry =====
   const int MAX_NEW_RETRY = 10; // Số lần thử tối đa cho CMQNEW
-  String cmd = String("AT+CMQNEW=\"") + MQTT_SERVER + "\"," + MQTT_PORT + ",12000,1024"; // Lệnh tạo kết nối MQTT mới
+  //String cmd = String("AT+CMQNEW=\"") + MQTT_SERVER + "\"," + MQTT_PORT + ",12000,1024"; // Lệnh tạo kết nối MQTT mới
+  String cmd = String("AT+CMQNEW=\"") + mqtt_server + "\"," + String(mqtt_port) + ",12000,1024";
   String resp; // Biến lưu phản hồi
   int newRetry = 0; // Biến đếm retry
   while (newRetry < MAX_NEW_RETRY) { // Lặp thử lại
@@ -351,8 +370,10 @@ bool mqttConnect() { // Hàm kết nối MQTT
   }
   // ===== CMQCON với retry =====
   const int MAX_CON_RETRY = 10; // Số lần thử tối đa cho CMQCON
-  String conCmd = String("AT+CMQCON=0,3,\"") + MQTT_CLIENT_ID +
-                  "\",120,1,0,\"" + MQTT_USERNAME + "\",\"\""; // Lệnh kết nối MQTT
+  // String conCmd = String("AT+CMQCON=0,3,\"") + MQTT_CLIENT_ID +
+  //                 "\",120,1,0,\"" + MQTT_USERNAME + "\",\"\""; // Lệnh kết nối MQTT
+  String conCmd = String("AT+CMQCON=0,3,\"") + mqtt_client_id +
+                  "\",120,1,0,\"" + mqtt_username + "\",\"" + mqtt_password + "\"";
   int conRetry = 0; // Biến đếm retry
   while (conRetry < MAX_CON_RETRY) { // Lặp thử lại
     resp = sendAT(conCmd, 10000); // Gửi lệnh
@@ -553,17 +574,17 @@ void MainTask(void *pvParameters) {
     Serial.println(" Kết nối MQTT thất bại! Thử lại sau 10 giây..."); // In lỗi
     vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ 10 giây
   }
-  while (!mqttSubscribe(MQTT_TOPIC)) { // Lặp đến khi subscribe thành công
+  while (!mqttSubscribe(mqtt_topic)) { // Lặp đến khi subscribe thành công
     Serial.println(" Thử đăng ký topic lại sau 10 giây..."); // In thử lại
     vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ 10 giây
   }
   for (;;) {
     if (camReady && simReady && mqttSubscribed && (millis() - lastSend > SEND_INTERVAL_MS)) { // Kiểm tra điều kiện gửi
       Serial.println(" " + payload); // In payload
-      while (!mqttPublishLarge(MQTT_TOPIC, payload)) { // Lặp đến khi publish thành công
+      while (!mqttPublishLarge(mqtt_topic, payload)) { // Lặp đến khi publish thành công
         Serial.println(" Publish lỗi, thử reconnect..."); // In lỗi
         mqttConnect(); // Thử reconnect
-        while (!mqttSubscribe(MQTT_TOPIC)) { // Thử subscribe lại
+        while (!mqttSubscribe(mqtt_topic)) { // Thử subscribe lại
           Serial.println(" Thử đăng ký topic lại sau 10 giây..."); // In thử lại
           vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ 10 giây
         }
@@ -601,7 +622,7 @@ void MainTask(void *pvParameters) {
           Serial.println(" Kết nối MQTT thất bại! Thử lại sau 10 giây..."); // In lỗi
           vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ
         }
-        while (!mqttSubscribe(MQTT_TOPIC)) { // Thử subscribe lại
+        while (!mqttSubscribe(mqtt_topic)) { // Thử subscribe lại
           Serial.println(" Thử đăng ký topic lại sau 10 giây..."); // In thử lại
           vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ
         }
@@ -610,68 +631,353 @@ void MainTask(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(20)); // Chờ 20ms mỗi loop
   }
 }
-void setup() { // Hàm setup chạy một lần khi khởi động
-  esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+void loadConfig() {
+  preferences.begin("config", false);
+  mqtt_server = preferences.getString("mqtt_server", "");
+  mqtt_port = preferences.getInt("mqtt_port", 0);
+  mqtt_client_id = preferences.getString("client_id", "");
+  mqtt_username = preferences.getString("username", "");
+  mqtt_password = preferences.getString("password", "");
+  mqtt_topic = preferences.getString("topic", "");
+  preferences.end();
+}
+const char* html_page = R"rawliteral(
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cấu Hình Đồng Hồ Nước NB-IoT</title>
+  <style>
+    :root {
+      --primary-color: #0056b3;
+      --primary-hover: #004494;
+      --bg-gradient-1: #e0eafc;
+      --bg-gradient-2: #cfdef3;
+      --text-color: #333;
+    }
+    body { 
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+      margin: 0; 
+      padding: 0; 
+      background: linear-gradient(135deg, var(--bg-gradient-1) 0%, var(--bg-gradient-2) 100%); 
+      color: var(--text-color);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    .container { 
+      background: #ffffff; 
+      width: 100%; 
+      max-width: 420px; 
+      margin: 20px;
+      padding: 30px 25px; 
+      border-radius: 12px; 
+      box-shadow: 0 10px 30px rgba(0,0,0,0.1); 
+      box-sizing: border-box;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 25px;
+    }
+    .logo {
+      width: 70px;
+      height: 70px;
+      margin: 0 auto 10px auto;
+      background: #f0f4f8;
+      border-radius: 50%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      box-shadow: inset 0 2px 5px rgba(0,0,0,0.05);
+    }
+    .logo svg {
+      width: 40px;
+      height: 40px;
+      fill: var(--primary-color);
+    }
+    h2 { 
+      margin: 0; 
+      color: var(--primary-color); 
+      font-size: 22px;
+      font-weight: 600;
+    }
+    p.subtitle {
+      margin: 5px 0 0 0;
+      font-size: 13px;
+      color: #666;
+    }
+    .form-group {
+      margin-bottom: 15px;
+    }
+    label { 
+      display: block; 
+      font-size: 14px; 
+      font-weight: 600; 
+      margin-bottom: 6px; 
+      color: #555;
+    }
+    input[type=text], input[type=number], input[type=password] { 
+      width: 100%; 
+      padding: 12px; 
+      box-sizing: border-box; 
+      border: 1px solid #ced4da; 
+      border-radius: 6px; 
+      font-size: 14px; 
+      transition: all 0.3s ease;
+      background-color: #fcfcfc;
+    }
+    input[type=text]:focus, input[type=number]:focus, input[type=password]:focus {
+      border-color: var(--primary-color);
+      outline: none;
+      background-color: #fff;
+      box-shadow: 0 0 0 3px rgba(0, 86, 179, 0.15);
+    }
+    input[type=submit] { 
+      background-color: var(--primary-color); 
+      color: white; 
+      padding: 14px; 
+      border: none; 
+      width: 100%; 
+      border-radius: 6px; 
+      font-size: 16px; 
+      font-weight: 600;
+      cursor: pointer; 
+      margin-top: 10px;
+      transition: background-color 0.3s ease, transform 0.1s ease; 
+    }
+    input[type=submit]:hover { 
+      background-color: var(--primary-hover); 
+    }
+    input[type=submit]:active {
+      transform: scale(0.98);
+    }
+    .footer {
+      text-align: center;
+      margin-top: 20px;
+      font-size: 12px;
+      color: #888;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12,20A6,6 0 0,1 6,14C6,10 12,3.25 12,3.25C12,3.25 18,10 18,14A6,6 0 0,1 12,20M12,4.82C10.74,6.77 7.5,10.66 7.5,14A4.5,4.5 0 0,0 12,18.5A4.5,4.5 0 0,0 16.5,14C16.5,10.66 13.26,6.77 12,4.82M4.08,10.42C4.16,10.09 4.4,9.84 4.73,9.76L6.68,9.26C7,9.18 7.35,9.36 7.43,9.68C7.5,10 7.35,10.35 7.03,10.43L5.07,10.93C4.75,11.03 4.4,10.84 4.33,10.5C4.26,10.5 4.19,10.5 4.08,10.42M19.92,10.42C19.84,10.09 19.6,9.84 19.27,9.76L17.32,9.26C17,9.18 16.65,9.36 16.57,9.68C16.5,10 16.65,10.35 16.97,10.43L18.93,10.93C19.25,11.03 19.6,10.84 19.67,10.5C19.74,10.5 19.81,10.5 19.92,10.42M2.5,14A9.5,9.5 0 0,0 12,23.5A9.5,9.5 0 0,0 21.5,14C21.5,13.62 21.19,13.31 20.81,13.31C20.43,13.31 20.12,13.62 20.12,14A8.12,8.12 0 0,1 12,22.12A8.12,8.12 0 0,1 3.88,14C3.88,13.62 3.57,13.31 3.19,13.31C2.81,13.31 2.5,13.62 2.5,14Z" />
+        </svg>
+      </div>
+      <h2>Cấu Hình Thiết Bị</h2>
+      <p class="subtitle">Smart Water Meter - NB-IoT</p>
+    </div>
+
+    <form action="/save" method="POST">
+      <div class="form-group">
+        <label>MQTT Server:</label>
+        <input type="text" name="server" value="%s" placeholder="Ví dụ: broker.hivemq.com" required>
+      </div>
+      
+      <div class="form-group">
+        <label>MQTT Port:</label>
+        <input type="number" name="port" value="%s" placeholder="Ví dụ: 1883" required>
+      </div>
+
+      <div class="form-group">
+        <label>Client ID:</label>
+        <input type="text" name="client_id" value="%s" placeholder="Nhập Client ID của thiết bị" required>
+      </div>
+
+      <div class="form-group">
+        <label>Username:</label>
+        <input type="text" name="username" value="%s" placeholder="Bỏ trống nếu không có">
+      </div>
+
+      <div class="form-group">
+        <label>Password:</label>
+        <input type="password" name="password" value="%s" placeholder="Bỏ trống nếu không có">
+      </div>
+
+      <div class="form-group">
+        <label>Topic Gửi Data:</label>
+        <input type="text" name="topic" value="%s" placeholder="Ví dụ: watermeter/data" required>
+      </div>
+
+      <input type="submit" value="Lưu Cấu Hình & Khởi Động Lại">
+    </form>
+    
+    <div class="footer">
+      &copy; 2026 AI OCR Water Meter Project
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
+void handleRoot() {
+  char *buffer = (char *)malloc(8192);
+  if (buffer == NULL) {
+    server.send(500, "text/plain", "Loi het bo nho RAM ESP32!");
+    return;
+  }
+
+  // MẸO Ở ĐÂY: Nếu port là 0 thì biến thành chuỗi rỗng "", ngược lại thì chuyển thành chuỗi số
+  String portStr = (mqtt_port == 0) ? "" : String(mqtt_port);
+
+  // Điền dữ liệu an toàn
+  snprintf(buffer, 8192, html_page, 
+           mqtt_server.c_str(), 
+           portStr.c_str(),     // <--- Đã thay thế biến mqtt_port bằng chuỗi portStr
+           mqtt_client_id.c_str(), 
+           mqtt_username.c_str(), 
+           mqtt_password.c_str(), 
+           mqtt_topic.c_str());
+           
+  server.send(200, "text/html; charset=UTF-8", buffer);
+  free(buffer); 
+}
+
+void handleSave() {
+  if (server.hasArg("server") && server.hasArg("port")) {
+    preferences.begin("config", false);
+    preferences.putString("mqtt_server", server.arg("server"));
+    preferences.putInt("mqtt_port", server.arg("port").toInt());
+    preferences.putString("client_id", server.arg("client_id"));
+    preferences.putString("username", server.arg("username"));
+    preferences.putString("password", server.arg("password"));
+    preferences.putString("topic", server.arg("topic"));
+    preferences.end();
+    
+    server.send(200, "text/html; charset=UTF-8", "<!DOCTYPE html><html><head><meta charset='UTF-8'></head><body><h2 style='text-align:center; color:green; margin-top:50px;'>Đã lưu cấu hình! Hệ thống đang khởi động lại...</h2></body></html>");
+    delay(2000);
+    ESP.restart(); // Khởi động lại vi điều khiển
+  }
+}
+
+// Chuyển hướng mọi request sai địa chỉ về trang chủ (Captive Portal mechanism)
+void handleNotFound() {
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void startCaptivePortal() {
+  isAPMode = true;
+  Serial.println("\n[!] VÀO CHẾ ĐỘ CẤU HÌNH AP");
+  
+  // Phát WiFi
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP32_Water_Meter", "12345678"); 
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+
+  // Khởi chạy DNS Server để bẻ lái mọi traffic về ESP32
+  dnsServer.start(DNS_PORT, "*", IP);
+
+  // Cấu hình các đường dẫn Web
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound(handleNotFound); // Phục vụ Captive Portal
+  server.begin();
+  
+  // Hiển thị lên OLED cho kỹ thuật viên biết
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.drawStr(5, 20, "Access Point Mode:");
+  u8g2.drawStr(5, 40, "ESP32_Water_Meter");
+  u8g2.drawStr(5, 60, "IP: 192.168.4.1");
+  u8g2.sendBuffer();
+}
+void setup() { 
+  // 1. MỞ SERIAL VÀ I2C ĐẦU TIÊN (Cho OLED và RTC)
+  Serial.begin(115200);
+  Wire.begin(5,6); // Dùng chân 5, 6 cho OLED và PCF8563
+  Wire.setClock(100000);
+  i2cMutex = xSemaphoreCreateMutex();
+
+  // 2. KHỞI TẠO RTC SAU KHI I2C ĐÃ MỞ
   rtc.init();
   Time currentTime = rtc.getTime();
-  if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0) {
-    Serial.begin(115200);
-    Wire.begin(5, 6);      
-    Wire.setClock(100000);   // giảm tốc cho ổn định
+  
+  esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
 
-    i2cMutex = xSemaphoreCreateMutex();
+  if (wakeup_cause == ESP_SLEEP_WAKEUP_EXT0) {
+    // =========================================================
+    // NHÁNH 1: THỨC DẬY TỪ NÚT NHẤN (CHỈ ĐỂ XEM PIN)
+    // =========================================================
     Serial.println("\n=== Woken by button ===");
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
+    
     u8g2.begin();
     u8g2.setContrast(255);
+    
     float usbVoltage = readUSBVoltage();
-
-    if(usbVoltage > 3.0)
-    {
+    if(usbVoltage > 3.0) {
       showBatteryScreen(0);
-    }
-    else
-    {
+    } else {
       float voltage = readBatteryVoltage();
-
       int batteryLevel = voltageToPercent(voltage);
-
       showBatteryScreen(batteryLevel);
     }
+    
     isDisplayOn = true;
     unsigned long startWait = millis();
     while (millis() - startWait < DISPLAY_TIMEOUT) {
       delay(10);
     }
     turnOffDisplay();
+    
     long passed_sec = time_diff_seconds(currentTime, sleepStartTime);
     unsigned long passed_ms = passed_sec * 1000UL;
     unsigned long remaining_ms = (passed_ms < sleepDurationMs) ? sleepDurationMs - passed_ms : 1000UL;
+    
     rtc_gpio_pullup_en(GPIO_NUM_2);
     rtc_gpio_pulldown_dis(GPIO_NUM_2);
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_2, 0);
     esp_sleep_enable_timer_wakeup(remaining_ms * 1000ULL);
     esp_deep_sleep_start();
+    
   } else {
-    Serial.begin(115200);
+    // =========================================================
+    // NHÁNH 2: KHỞI ĐỘNG BÌNH THƯỜNG / VÀO CHẾ ĐỘ AP
+    // =========================================================
+    pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+    
+    // Đọc cấu hình từ Flash
+    loadConfig();
 
-    i2cMutex = xSemaphoreCreateMutex();   // ✅ BẮT BUỘC
+    // CHO NGƯỜI DÙNG 2 GIÂY ĐỂ BẤM NÚT
+    Serial.println("\n[INFO] Đang chờ 2 giây... Nhấn GIỮ nút ngay bây giờ để vào cấu hình AP!");
+    delay(2000); 
 
-    Wire.begin(39, 40);                  // ✅ BẮT BUỘC
-    Wire.setClock(100000);
-    ++bootCount; // Tăng số lần boot
-    if(bootCount > 1) { // Nếu không phải boot đầu tiên
-      //  Deep Sleep Wakeup Buzzer
-      for (int i = 0; i < 2; i++) { beep(2000, 500); delay(500); } // Phát buzzer 2 lần khi tỉnh từ deep sleep
+    // Kiểm tra xem nút có đang bị giữ không
+    if (digitalRead(USER_BUTTON_PIN) == LOW) {
+      Serial.println("\n[!] Đã phát hiện nút nhấn, hãy giữ thêm 3 giây...");
+      delay(3000); // Xác nhận cố tình giữ
+      
+      if (digitalRead(USER_BUTTON_PIN) == LOW) {
+        // Bật OLED để báo hiệu đang ở chế độ AP (Dùng cấu hình I2C chân 5,6 ở trên cùng)
+        u8g2.begin();
+        u8g2.setContrast(255);
+        
+        startCaptivePortal(); // Chạy Web Server
+        return; // Cắt đứt luồng setup, không chạy Camera và SIM
+      }
     }
-    delay(1000); // Chờ 1 giây
-    Serial.begin(115200); // Khởi tạo Serial với baud 115200
-    Serial.println("\n=== ESP32S3 + SIM7020G MQTT (Send Image to test.mosquitto.org) ===");
-    Serial.println("Boot number: " + String(bootCount)); // In số lần boot
-    pinMode(USER_BUTTON_PIN, INPUT_PULLUP); // Thiết lập chân nút nhấn với pull-up
-    pinMode(BUZZER_PIN, OUTPUT); // Thiết lập chân buzzer output
-    digitalWrite(BUZZER_PIN, LOW); // Tắt buzzer ban đầu
+
+    // --- TIẾP TỤC QUÁ TRÌNH KHỞI ĐỘNG CHÍNH ---
+    ++bootCount; 
+    if(bootCount > 1) { 
+      for (int i = 0; i < 2; i++) { beep(2000, 500); delay(500); } 
+    }
+    delay(1000); 
+    
+    Serial.println("\n=== ESP32S3 + SIM7020G MQTT (Send Image) ===");
+    Serial.println("Boot number: " + String(bootCount)); 
+    
+    pinMode(BUZZER_PIN, OUTPUT); 
+    digitalWrite(BUZZER_PIN, LOW); 
     analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
     analogSetPinAttenuation(USB_PIN, ADC_11db);
     analogReadResolution(12);
@@ -679,26 +985,41 @@ void setup() { // Hàm setup chạy một lần khi khởi động
     pinMode(BATTERY_PIN, INPUT);
     pinMode(USB_PIN, INPUT);
     pinMode(FLASH_LED, OUTPUT);
-    //OLED
-    u8g2.begin(); // Khởi tạo OLED
-    u8g2.setContrast(255); // Đặt độ tương phản tối đa
-    turnOffDisplay(); // Tắt màn hình ban đầu
-    //RTC
-    //  Chỉ cần set thời gian 1 lần rồi comment lại sau
+    
+    u8g2.begin(); 
+    u8g2.setContrast(255); 
+    turnOffDisplay(); 
+    
+    // Đồng bộ RTC (Chỉ cần chạy 1 lần rồi có thể comment lại)
     xSemaphoreTake(i2cMutex, portMAX_DELAY);
-    rtc.stopClock(); // Dừng clock RTC
-    rtc.setYear(25); // Năm 2025
-    rtc.setMonth(10); // Tháng 10
-    rtc.setDay(29); // Ngày 29
-    rtc.setHour(10); // Giờ 10
-    rtc.setMinut(45); // Phút 45
-    rtc.setSecond(0); // Giây 0
-    rtc.startClock(); // Bắt đầu clock RTC
+    rtc.stopClock(); 
+    rtc.setYear(25); 
+    rtc.setMonth(10); 
+    rtc.setDay(29); 
+    rtc.setHour(10); 
+    rtc.setMinut(45); 
+    rtc.setSecond(0); 
+    rtc.startClock(); 
     xSemaphoreGive(i2cMutex);
-    xTaskCreate(ButtonTask, "ButtonTask", 4096, NULL, 10, NULL); // Ưu tiên cao nhất
-    xTaskCreate(MainTask, "MainTask", 8192, NULL, 1, NULL); // Ưu tiên thấp hơn
+    
+    xTaskCreate(ButtonTask, "ButtonTask", 4096, NULL, 10, NULL); 
+    xTaskCreate(MainTask, "MainTask", 8192, NULL, 1, NULL); 
   }
 }
 void loop() {
-  vTaskDelete(NULL); // Xóa task loop mặc định của Arduino
+  if (isAPMode) {
+    dnsServer.processNextRequest(); // Phản hồi DNS cho Captive Portal
+    server.handleClient();          // Phản hồi HTTP
+    delay(10);                      // Nhường CPU cho các tác vụ nền của WiFi
+  } else {
+    vTaskDelete(NULL); 
+  }
 }
+
+  
+
+
+
+
+
+
