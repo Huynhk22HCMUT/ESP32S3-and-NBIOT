@@ -353,10 +353,10 @@ bool mqttConnect() { // Hàm kết nối MQTT
   // ===== CMQNEW với retry =====
   const int MAX_NEW_RETRY = 10; // Số lần thử tối đa cho CMQNEW
   //String cmd = String("AT+CMQNEW=\"") + MQTT_SERVER + "\"," + MQTT_PORT + ",12000,1024"; // Lệnh tạo kết nối MQTT mới
-  String cmd = String("AT+CMQNEW=\"") + mqtt_server + "\"," + String(mqtt_port) + ",12000,1024";
+  String cmd = String("AT+CMQNEW=\"") + mqtt_server + "\"," + String(mqtt_port) + ",12000,1024"; 
   String resp; // Biến lưu phản hồi
   int newRetry = 0; // Biến đếm retry
-  while (newRetry < MAX_NEW_RETRY) { // Lặp thử lại
+  while (newRetry < MAX_NEW_RETRY) { // Lặp thử lạiF
     resp = sendAT(cmd, 8000); // Gửi lệnh
     if (resp.indexOf("OK") != -1 || resp.indexOf("+CMQNEW:") != -1) { // Nếu thành công
       Serial.println(" CMQNEW OK"); // In thành công
@@ -611,7 +611,7 @@ Serial.println(" Capturing image...");
 
     isAdminCheckPhase = true; // Đánh dấu lần thức sau là để Check lệnh
     
-    uint32_t sleepSeconds = 4 * 60; // YÊU CẦU: Ngủ đúng 4 phút rồi dậy check
+    uint32_t sleepSeconds = 2 * 60; // YÊU CẦU: Ngủ đúng 4 phút rồi dậy check
     goToDeepSleep(sleepSeconds);
   } 
   // ===============================================
@@ -630,7 +630,9 @@ Serial.println(" Capturing image...");
     while (millis() - waitStart < 15000) { 
       if (sim.available()) {
         String line = sim.readString();
-        if (line.indexOf("+CMQRECV") != -1 && (line.indexOf("CAPTURE") != -1 || line.indexOf("capture") != -1)) {
+        Serial.println("<<< " + line); // In tất cả phản hồi để debug
+// Nhận diện cả mã HEX của module SIM và Plain Text (dự phòng)
+        if (line.indexOf("+CMQPUB") != -1 && (line.indexOf("43415054555245") != -1 || line.indexOf("63617074757265") != -1 || line.indexOf("CAPTURE") != -1)) {
           isCommandReceived = true;
           Serial.println(" >>> PHÁT HIỆN LỆNH CHỤP ẢNH <<<");
           clearAdminCommand(); // Gửi lệnh CLEAR đè lên
