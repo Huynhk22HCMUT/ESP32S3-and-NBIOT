@@ -864,23 +864,34 @@ void startCaptivePortal() {
   isAPMode = true;
   Serial.println("\n[!] VÀO CHẾ ĐỘ CẤU HÌNH AP");
   
-  // Phát WiFi
+  // 1. Tẩy xóa toàn bộ cấu hình WiFi cũ bị kẹt trong ROM
+  WiFi.disconnect(true, true);
+  delay(100);
+
+  // 2. Thiết lập IP tĩnh (BẮT BUỘC để không bị treo IP ở lần thứ 2)
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress netMsk(255, 255, 255, 0);
+
+  // 3. Khởi động AP với IP tĩnh
   WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, netMsk); 
   WiFi.softAP("ESP32_Water_Meter", "12345678"); 
-  IPAddress IP = WiFi.softAPIP();
+  
+  delay(500); // Cho hệ thống mạng 0.5s để ổn định
+  
   Serial.print("AP IP address: ");
-  Serial.println(IP);
+  Serial.println(WiFi.softAPIP());
 
-  // Khởi chạy DNS Server để bẻ lái mọi traffic về ESP32
-  dnsServer.start(DNS_PORT, "*", IP);
+  // 4. Khởi chạy DNS Server để bẻ lái mọi traffic về trang web
+  dnsServer.start(DNS_PORT, "*", apIP);
 
-  // Cấu hình các đường dẫn Web
+  // 5. Cấu hình các đường dẫn Web
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.onNotFound(handleNotFound); // Phục vụ Captive Portal
+  server.onNotFound(handleNotFound); 
   server.begin();
   
-  // Hiển thị lên OLED cho kỹ thuật viên biết
+  // Hiển thị lên OLED
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
   u8g2.drawStr(5, 20, "Access Point Mode:");
