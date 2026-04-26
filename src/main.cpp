@@ -26,7 +26,7 @@ String mqtt_client_id = "";
 String mqtt_username = "";
 String mqtt_password = "";
 String mqtt_topic = "";
-
+String mqtt_cmd_topic = "";
 bool isAPMode = false;
 SemaphoreHandle_t i2cMutex;
 // ===== OLED SSD1306 + RTC PCF8563 =====
@@ -64,6 +64,9 @@ bool mqttSubscribed = false; // Cờ kiểm tra xem đã subscribe topic MQTT ch
 RTC_DATA_ATTR int bootCount = 0; // Biến lưu số lần boot, lưu trữ trong RTC memory để giữ giá trị qua deep sleep
 RTC_DATA_ATTR Time sleepStartTime;
 RTC_DATA_ATTR unsigned long sleepDurationMs = 0;
+// THÊM: 2 biến quản lý State Machine (Máy trạng thái)
+RTC_DATA_ATTR uint32_t targetNextPeriodicEpoch = 0; // Mốc thời gian tuyệt đối của chu kì 10p
+RTC_DATA_ATTR bool isAdminCheckPhase = false; // Cờ: false = Chụp định kì, true = Thức để check lệnh
 // ================== READY FLAGS ==================
 bool camReady = false; // Cờ kiểm tra camera đã sẵn sàng chưa
 bool simReady = false; // Cờ kiểm tra SIM đã sẵn sàng chưa
@@ -434,79 +437,63 @@ bool mqttResetSession(uint8_t retries = 5) { // Hàm reset session MQTT
   return false; // Thất bại
 }
 // ================== MQTT PUBLISH LARGE ==================
-bool mqttPublishLarge(const String& topic, const String& payload) { // Hàm publish payload lớn theo chunk
-  const size_t CHUNK_SIZE = 500; // Kích thước mỗi chunk (500 bytes)
-  Serial.println(" Bắt đầu gửi payload lớn theo từng phần..."); // In bắt đầu
-  size_t i = 0; // Chỉ số bắt đầu payload
-  int retryCount = 0; // Đếm retry cho chunk
-  const int MAX_RETRY = 5; // Thử lại tối đa 5 lần cho mỗi chunk
-  while (i < payload.length()) { // Lặp qua toàn bộ payload
-    String chunk = payload.substring(i, min(i + CHUNK_SIZE, payload.length())); // Lấy chunk
-    // Chuyển chunk sang HEX
-    String hex; // Chuỗi HEX
-    const char hexChars[] = "0123456789ABCDEF"; // Bảng ký tự HEX
-    for (size_t j = 0; j < chunk.length(); j++) { // Chuyển từng byte sang HEX
-      uint8_t c = chunk[j]; // Lấy byte
-      hex += hexChars[c >> 4]; // Phần cao
-      hex += hexChars[c & 0xF]; // Phần thấp
+// ================== MQTT PUBLISH RAW BINARY ==================
+bool mqttPublishRaw(const String& topic, uint8_t* data, size_t len) { 
+  // CHUNK_SIZE = 250 bytes raw -> 500 ký tự HEX. An toàn tuyệt đối cho buffer của lệnh AT
+  const size_t CHUNK_SIZE = 250; 
+  Serial.printf(" Bắt đầu gửi ảnh RAW (%d bytes) theo từng phần...\n", len); 
+  
+  size_t i = 0; 
+  int retryCount = 0; 
+  const int MAX_RETRY = 5; 
+  
+  while (i < len) { 
+    size_t currentChunkSize = min(CHUNK_SIZE, len - i);
+    
+    // Khởi tạo và cấp trước bộ nhớ cho chuỗi HEX để chống phân mảnh RAM
+    String hex; 
+    hex.reserve(currentChunkSize * 2 + 1); 
+    const char hexChars[] = "0123456789ABCDEF"; 
+    
+    // DUY NHẤT 1 VÒNG LẶP CHUYỂN ĐỔI Ở ĐÂY
+    for (size_t j = 0; j < currentChunkSize; j++) { 
+      uint8_t c = data[i + j]; 
+      hex += hexChars[c >> 4]; 
+      hex += hexChars[c & 0xF]; 
     }
-    String cmd = String("AT+CMQPUB=0,\"") + topic + "\",0,0,0," +
-                 String(chunk.length() * 2) + ",\"" + hex + "\""; // Lệnh publish chunk HEX
+    
+    // Tạo lệnh publish AT
+    String cmd = String("AT+CMQPUB=0,\"") + topic + "\",0,0,0," + String(currentChunkSize * 2) + ",\"" + hex + "\""; 
+    
     Serial.printf(" Gửi chunk %u / %u (size=%u bytes)\n",
                   (unsigned)(i / CHUNK_SIZE + 1),
-                  (unsigned)((payload.length() + CHUNK_SIZE - 1) / CHUNK_SIZE),
-                  (unsigned)chunk.length()); // In thông tin chunk
-    String resp = sendAT(cmd, 8000); // Gửi lệnh
-    // Nếu lỗi khi gửi chunk
-    if (resp.indexOf("OK") == -1 && resp.indexOf("+CMQPUB:") == -1) { // Nếu không OK hoặc +CMQPUB
-      Serial.printf(" Lỗi khi gửi chunk tại byte %u → thử lại (lần %d/%d)\n",
-                    (unsigned)i, retryCount + 1, MAX_RETRY); // In lỗi
-      retryCount++; // Tăng retry
-      if (retryCount >= MAX_RETRY) { // Nếu hết retry
-        Serial.println(" Gửi lại nhiều lần vẫn lỗi → dừng gửi tiếp!"); // In dừng
-        return false; // Thất bại
+                  (unsigned)((len + CHUNK_SIZE - 1) / CHUNK_SIZE),
+                  (unsigned)currentChunkSize); 
+                  
+    String resp = sendAT(cmd, 8000); 
+    
+    // Xử lý khi lỗi
+    if (resp.indexOf("OK") == -1 && resp.indexOf("+CMQPUB:") == -1) { 
+      Serial.printf(" Lỗi khi gửi chunk → thử lại (lần %d/%d)\n", retryCount + 1, MAX_RETRY); 
+      retryCount++; 
+      if (retryCount >= MAX_RETRY) { 
+        Serial.println(" Gửi lại nhiều lần vẫn lỗi → dừng gửi tiếp!"); 
+        return false; 
       }
-      delay(2000); // chờ ngắn trước khi thử lại
-      continue; // thử lại chunk hiện tại
+      delay(2000); 
+      continue; // Thử lại chunk hiện tại
     }
-    // Chunk gửi thành công → reset retry và chuyển tiếp chunk tiếp theo
-    retryCount = 0; // Reset retry
-    i += CHUNK_SIZE; // Chuyển đến chunk tiếp
-    delay(800); // Chờ 800ms giữa các chunk
+    
+    // Thành công -> Đi tới chunk tiếp theo
+    retryCount = 0; 
+    i += currentChunkSize; 
+    delay(800); // Tránh ngập lụt mạng NB-IoT
   }
-  Serial.println(" Gửi toàn bộ ảnh hoàn tất!"); // In hoàn tất
-  return true; // Thành công
+  
+  Serial.println(" Gửi toàn bộ ảnh hoàn tất!"); 
+  return true; 
 }
 // ================== CAPTURE + PAYLOAD ==================
-String makePayload() { // Hàm chụp ảnh và tạo payload JSON
-  Serial.println(" Capturing image..."); // In bắt đầu chụp
-  digitalWrite(FLASH_LED, HIGH);
-  delay(200);
-  camera_fb_t* fb = esp_camera_fb_get(); // Lấy frame buffer từ camera
-  if (!fb) { // Nếu thất bại
-    Serial.println(" Camera capture failed!"); // In lỗi
-    return "{}"; // Trả về JSON rỗng
-  }
-  else {
-    //  Buzzer kêu “bíp bíp” ba lần
-    for (int i = 0; i < 3; i++) { // Phát buzzer 3 lần
-      beep(2000, 500); // 2kHz trong 0.5s
-      delay(500); // Chờ giữa các beep
-    }
-  }
-  Serial.printf(" Image captured, size: %d bytes\n", fb->len); // In kích thước ảnh
-  String hexImg; // Chuỗi HEX
-  const char hexChars[] = "0123456789ABCDEF"; // Bảng ký tự HEX
-  for (size_t j = 0; j < fb->len; j++) { // Chuyển từng byte sang HEX
-    uint8_t c = fb->buf[j]; // Lấy byte
-    hexImg += hexChars[c >> 4]; // Phần cao
-    hexImg += hexChars[c & 0xF]; // Phần thấp
-  }
-  esp_camera_fb_return(fb); // Trả frame buffer
-  digitalWrite(FLASH_LED, LOW);
-  String json = "{\"image\":\"" + hexImg + "\"}"; // Tạo JSON với ảnh hex
-  return json; // Trả về JSON
-}
 long time_diff_seconds(Time t2, Time t1) {
   long hdiff = t2.hour - t1.hour;
   long mdiff = t2.minute - t1.minute;
@@ -545,90 +532,158 @@ void ButtonTask(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(20)); // Chờ 20ms
   }
 }
+
+// Hàm 1: Đổi lịch RTC thành số giây (Epoch) để tính giờ chuẩn xác
+uint32_t getEpoch() {
+  Time t = rtc.getTime();
+  uint16_t y = t.year + 2000; uint8_t m = t.month; uint8_t d = t.day;
+  if (m <= 2) { m += 12; y -= 1; }
+  uint32_t days = 365 * y + y / 4 - y / 100 + y / 400 + (153 * m + 8) / 5 + d - 306;
+  return days * 86400 + t.hour * 3600 + t.minute * 60 + t.second;
+}
+
+// Hàm 2: Gửi lệnh xóa chữ CAPTURE trên server để không bị kẹt
+void clearAdminCommand() {
+  Serial.println(" Xóa lệnh trên Server...");
+  String cmd = String("AT+CMQPUB=0,\"") + mqtt_cmd_topic + "\",1,0,1,10,\"434C454152\"";
+  sendAT(cmd, 3000);
+}
+
+// Hàm 3: Hàm đi ngủ chuẩn hóa
+void goToDeepSleep(uint32_t sleepSeconds) {
+  Serial.printf("\n>>> ĐI VÀO DEEP SLEEP TRONG %u GIÂY <<<\n", sleepSeconds);
+  mqttResetSession();
+  sleepStartTime = rtc.getTime();
+  sleepDurationMs = sleepSeconds * 1000UL;
+  rtc_gpio_pullup_en(GPIO_NUM_2); rtc_gpio_pulldown_dis(GPIO_NUM_2);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_2, 0);
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepSeconds * 1000000ULL);
+  Serial.flush();
+  esp_deep_sleep_start();
+}
 void MainTask(void *pvParameters) {
-  camReady = false; // Reset cờ camera
-  simReady = false; // Reset cờ SIM
-  while (!camReady) { // Lặp đến khi camera sẵn sàng
-    if (initCamera()) { // Thử khởi tạo camera
-      camReady = true; // Đặt cờ sẵn sàng
+  uint32_t currentEpoch = getEpoch();
+
+  // Nếu là lần đầu tiên khởi động, thiết lập mốc 10 phút sau (600s)
+  if (bootCount <= 1) {
+    isAdminCheckPhase = false;
+    targetNextPeriodicEpoch = currentEpoch + 600; 
+  }
+
+  // Khởi tạo phần cứng & Kết nối
+  while (!initCamera()) vTaskDelay(pdMS_TO_TICKS(2000)); 
+  camReady = true;
+  sim.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN); 
+  vTaskDelay(pdMS_TO_TICKS(1000)); 
+  while (!initSIM()) vTaskDelay(pdMS_TO_TICKS(2000)); 
+  simReady = true;
+  while(!mqttConnect()) vTaskDelay(pdMS_TO_TICKS(10000)); 
+
+  // ===============================================
+  // TRẠNG THÁI 1: CHỤP ẢNH ĐỊNH KÌ
+  // ===============================================
+  if (!isAdminCheckPhase) {
+    Serial.println("\n [TRẠNG THÁI] -> CHỤP ẢNH ĐỊNH KÌ");
+    
+Serial.println(" Capturing image..."); 
+    digitalWrite(FLASH_LED, HIGH); delay(200);
+    
+    camera_fb_t* fb = esp_camera_fb_get(); // Chụp ảnh, lấy dữ liệu vào RAM
+    digitalWrite(FLASH_LED, LOW);
+    
+    if (!fb) {
+      Serial.println(" Lỗi: Camera capture failed!"); 
     } else {
-      Serial.println("❌ Không thể khởi tạo camera! Thử lại sau 2 giây..."); // In lỗi
-      vTaskDelay(pdMS_TO_TICKS(2000)); // chờ trước khi thử lại
+      // Beep báo hiệu chụp thành công
+      for (int i = 0; i < 3; i++) { beep(2000, 500); delay(500); }
+      
+      // Gọi hàm Publish RAW mới
+      while (!mqttPublishRaw(mqtt_topic, fb->buf, fb->len)) {
+         Serial.println(" Publish lỗi, thử reconnect..."); 
+         mqttConnect();
+      }
+      
+      // QUAN TRỌNG: Gửi xong BẮT BUỘC phải giải phóng bộ nhớ ảnh
+      esp_camera_fb_return(fb); 
+      Serial.println(" [OK] Đã gửi ảnh xong và giải phóng RAM.");
     }
-  }
-  vTaskDelay(pdMS_TO_TICKS(30000));
-  payload = makePayload(); // Chụp ảnh và tạo payload ngay sau khi khởi tạo camera
-  afterPhotoTime = millis(); // Lưu thời gian sau chụp
-  lastSend = afterPhotoTime - SEND_INTERVAL_MS - 1; // Đặt lastSend để kích hoạt gửi ngay
-  sim.begin(SIM_BAUD, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN); // Khởi tạo Serial cho SIM
-  vTaskDelay(pdMS_TO_TICKS(1000)); // Chờ 1 giây
-  while (!simReady) { // Lặp đến khi SIM sẵn sàng
-    if (initSIM()) { // Thử khởi tạo SIM
-      simReady = true; // Đặt cờ sẵn sàng
+    Serial.println(" [OK] Đã gửi ảnh định kì.");
+
+    isAdminCheckPhase = true; // Đánh dấu lần thức sau là để Check lệnh
+    
+    uint32_t sleepSeconds = 4 * 60; // YÊU CẦU: Ngủ đúng 4 phút rồi dậy check
+    goToDeepSleep(sleepSeconds);
+  } 
+  // ===============================================
+  // TRẠNG THÁI 2: THỨC CHECK LỆNH ADMIN
+  // ===============================================
+  else {
+    Serial.println("\n [TRẠNG THÁI] -> LẮNG NGHE LỆNH ADMIN");
+    
+    // Subscribe vào topic nhận lệnh thay vì topic data
+    while (!mqttSubscribe(mqtt_cmd_topic)) vTaskDelay(pdMS_TO_TICKS(5000));
+    
+    Serial.println(" Đang chờ bản tin từ Broker trong 15 giây...");
+    bool isCommandReceived = false;
+    unsigned long waitStart = millis();
+    
+    while (millis() - waitStart < 15000) { 
+      if (sim.available()) {
+        String line = sim.readString();
+        if (line.indexOf("+CMQRECV") != -1 && (line.indexOf("CAPTURE") != -1 || line.indexOf("capture") != -1)) {
+          isCommandReceived = true;
+          Serial.println(" >>> PHÁT HIỆN LỆNH CHỤP ẢNH <<<");
+          clearAdminCommand(); // Gửi lệnh CLEAR đè lên
+          break;
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (isCommandReceived) {
+      for (int i = 0; i < 3; i++) { beep(3000, 150); delay(100); } // Beep báo hiệu
+Serial.println(" Capturing image..."); 
+    digitalWrite(FLASH_LED, HIGH); delay(200);
+    
+    camera_fb_t* fb = esp_camera_fb_get(); // Chụp ảnh, lấy dữ liệu vào RAM
+    digitalWrite(FLASH_LED, LOW);
+    
+    if (!fb) {
+      Serial.println(" Lỗi: Camera capture failed!"); 
     } else {
-      Serial.println(" Lỗi khởi tạo SIM! Thử lại sau 2 giây..."); // In lỗi
-      vTaskDelay(pdMS_TO_TICKS(2000)); // chờ trước khi thử lại
-    }
-  }
-  while(!mqttConnect()) { // Lặp đến khi kết nối MQTT thành công
-    Serial.println(" Kết nối MQTT thất bại! Thử lại sau 10 giây..."); // In lỗi
-    vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ 10 giây
-  }
-  while (!mqttSubscribe(mqtt_topic)) { // Lặp đến khi subscribe thành công
-    Serial.println(" Thử đăng ký topic lại sau 10 giây..."); // In thử lại
-    vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ 10 giây
-  }
-  for (;;) {
-    if (camReady && simReady && mqttSubscribed && (millis() - lastSend > SEND_INTERVAL_MS)) { // Kiểm tra điều kiện gửi
-      Serial.println(" " + payload); // In payload
-      while (!mqttPublishLarge(mqtt_topic, payload)) { // Lặp đến khi publish thành công
-        Serial.println(" Publish lỗi, thử reconnect..."); // In lỗi
-        mqttConnect(); // Thử reconnect
-        while (!mqttSubscribe(mqtt_topic)) { // Thử subscribe lại
-          Serial.println(" Thử đăng ký topic lại sau 10 giây..."); // In thử lại
-          vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ 10 giây
-        }
+      // Beep báo hiệu chụp thành công
+      for (int i = 0; i < 3; i++) { beep(2000, 500); delay(500); }
+      
+      // Gọi hàm Publish RAW mới
+      while (!mqttPublishRaw(mqtt_topic, fb->buf, fb->len)) {
+         Serial.println(" Publish lỗi, thử reconnect..."); 
+         mqttConnect();
       }
-      lastSend = millis(); // Cập nhật thời gian gửi cuối
-      unsigned long endSend = millis(); // Lấy thời gian kết thúc gửi
-      unsigned long t_process = endSend - afterPhotoTime; // Tính thời gian xử lý sau chụp
-      unsigned long t_boot_to_photo = afterPhotoTime; // Tính thời gian từ boot đến sau chụp
-      unsigned long total_awake = t_process + t_boot_to_photo;
-      unsigned long sleepTime = (total_awake < SEND_INTERVAL_MS) ? (SEND_INTERVAL_MS - total_awake) : 1000UL; // Tính thời gian ngủ = 5p - total_awake
-      // Reset session MQTT trước khi ngủ
-      while (!mqttResetSession()) { // Lặp đến khi reset thành công
-        Serial.println(" Không thể reset session MQTT, thử lại sau 5s..."); // In lỗi
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Chờ 5 giây
-      }
-      for (int i = 0; i < 3; i++) { beep(2000, 500); vTaskDelay(pdMS_TO_TICKS(500)); } // beep trước khi ngủ
-      //  Deep Sleep sau khi gửi xong
-      Serial.println(" Đã sử dụng hết " + String( total_awake/ 1000) + " giây...");
-      Serial.println(" Đi vào Deep Sleep trong " + String(sleepTime / 1000) + " giây..."); // In đi ngủ
-      sleepStartTime = rtc.getTime();
-      sleepDurationMs = sleepTime;
-      rtc_gpio_pullup_en(GPIO_NUM_2);
-      rtc_gpio_pulldown_dis(GPIO_NUM_2);
-      esp_sleep_enable_ext0_wakeup(GPIO_NUM_2, 0);
-      esp_sleep_enable_timer_wakeup(sleepTime * 1000ULL); // Thiết lập wakeup timer (microseconds)
-      Serial.flush(); // Flush Serial
-      esp_deep_sleep_start(); // Bắt đầu deep sleep
+      
+      // QUAN TRỌNG: Gửi xong BẮT BUỘC phải giải phóng bộ nhớ ảnh
+      esp_camera_fb_return(fb); 
+      Serial.println(" [OK] Đã gửi ảnh xong và giải phóng RAM.");
     }
-    // Xử lý mất kết nối MQTT
-    if (sim.available()) { // Nếu có dữ liệu từ SIM
-      String line = sim.readString(); // Đọc dòng
-      if (line.indexOf("+CMQDISCON") != -1) { // Nếu mất kết nối MQTT
-        Serial.println(" MQTT bị ngắt! Reconnect..."); // In cảnh báo
-        while(!mqttConnect()) { // Thử reconnect
-          Serial.println(" Kết nối MQTT thất bại! Thử lại sau 10 giây..."); // In lỗi
-          vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ
-        }
-        while (!mqttSubscribe(mqtt_topic)) { // Thử subscribe lại
-          Serial.println(" Thử đăng ký topic lại sau 10 giây..."); // In thử lại
-          vTaskDelay(pdMS_TO_TICKS(10000)); // Chờ
-        }
-      }
+      Serial.println(" [OK] Đã gửi ảnh theo lệnh Admin.");
+    } else {
+      Serial.println(" Không có lệnh nào được yêu cầu.");
     }
-    vTaskDelay(pdMS_TO_TICKS(20)); // Chờ 20ms mỗi loop
+
+    isAdminCheckPhase = false; // Đánh dấu lần thức sau là Chụp định kì
+    currentEpoch = getEpoch();
+    
+    // Tính số giây ngủ còn lại cho đến mốc 10 phút định kì
+    uint32_t sleepSeconds = 60; // Mặc định 1 phút an toàn
+    if (targetNextPeriodicEpoch > currentEpoch) {
+      sleepSeconds = targetNextPeriodicEpoch - currentEpoch;
+    } else {
+      sleepSeconds = 10; // Chống lỗi âm thời gian
+    }
+
+    // Đẩy mốc định kì lên thêm 10 phút (600s) cho chu trình tiếp theo
+    targetNextPeriodicEpoch = targetNextPeriodicEpoch + 600; 
+
+    goToDeepSleep(sleepSeconds);
   }
 }
 void loadConfig() {
@@ -639,6 +694,7 @@ void loadConfig() {
   mqtt_username = preferences.getString("username", "");
   mqtt_password = preferences.getString("password", "");
   mqtt_topic = preferences.getString("topic", "");
+  mqtt_cmd_topic = preferences.getString("cmd_topic", ""); // THÊM DÒNG NÀY
   preferences.end();
 }
 const char* html_page = R"rawliteral(
@@ -804,6 +860,11 @@ const char* html_page = R"rawliteral(
         <input type="text" name="topic" value="%s" placeholder="Ví dụ: watermeter/data" required>
       </div>
 
+      <div class="form-group">
+        <label>Topic Nhận Lệnh:</label>
+        <input type="text" name="cmd_topic" value="%s" placeholder="Ví dụ: watermeter/cmd" required>
+      </div>
+
       <input type="submit" value="Lưu Cấu Hình & Khởi Động Lại">
     </form>
     
@@ -831,7 +892,8 @@ void handleRoot() {
            mqtt_client_id.c_str(), 
            mqtt_username.c_str(), 
            mqtt_password.c_str(), 
-           mqtt_topic.c_str());
+           mqtt_topic.c_str(),
+           mqtt_cmd_topic.c_str());
            
   server.send(200, "text/html; charset=UTF-8", buffer);
   free(buffer); 
@@ -846,6 +908,7 @@ void handleSave() {
     preferences.putString("username", server.arg("username"));
     preferences.putString("password", server.arg("password"));
     preferences.putString("topic", server.arg("topic"));
+    preferences.putString("cmd_topic", server.arg("cmd_topic"));
     preferences.end();
     
     server.send(200, "text/html; charset=UTF-8", "<!DOCTYPE html><html><head><meta charset='UTF-8'></head><body><h2 style='text-align:center; color:green; margin-top:50px;'>Đã lưu cấu hình! Hệ thống đang khởi động lại...</h2></body></html>");
@@ -979,8 +1042,14 @@ void setup() {
 
     // --- TIẾP TỤC QUÁ TRÌNH KHỞI ĐỘNG CHÍNH ---
     ++bootCount; 
-    if(bootCount > 1) { 
-      for (int i = 0; i < 2; i++) { beep(2000, 500); delay(500); } 
+    if (bootCount > 1) { 
+      if (isAdminCheckPhase) {
+        // [Cập nhật] Thức dậy chỉ để kiểm tra lệnh Admin: Kêu Bíp 1 lần
+        beep(2000, 500); 
+      } else {
+        // Thức dậy để chụp ảnh định kì: Kêu Bíp 2 lần (như cũ)
+        for (int i = 0; i < 2; i++) { beep(2000, 500); delay(500); } 
+      }
     }
     delay(1000); 
     
@@ -1003,14 +1072,14 @@ void setup() {
     
     // Đồng bộ RTC (Chỉ cần chạy 1 lần rồi có thể comment lại)
     xSemaphoreTake(i2cMutex, portMAX_DELAY);
-    rtc.stopClock(); 
-    rtc.setYear(25); 
-    rtc.setMonth(10); 
-    rtc.setDay(29); 
-    rtc.setHour(10); 
-    rtc.setMinut(45); 
-    rtc.setSecond(0); 
-    rtc.startClock(); 
+    // rtc.stopClock(); 
+    // rtc.setYear(25); 
+    // rtc.setMonth(10); 
+    // rtc.setDay(29); 
+    // rtc.setHour(10); 
+    // rtc.setMinut(45); 
+    // rtc.setSecond(0); 
+    // rtc.startClock(); 
     xSemaphoreGive(i2cMutex);
     
     xTaskCreate(ButtonTask, "ButtonTask", 4096, NULL, 10, NULL); 
