@@ -586,7 +586,7 @@ void MainTask(void *pvParameters) {
     Serial.println("\n [TRẠNG THÁI] -> CHỤP ẢNH ĐỊNH KÌ");
     
 Serial.println(" Capturing image..."); 
-    digitalWrite(FLASH_LED, HIGH); delay(200);
+    digitalWrite(FLASH_LED, HIGH); delay(2000);
     
     camera_fb_t* fb = esp_camera_fb_get(); // Chụp ảnh, lấy dữ liệu vào RAM
     digitalWrite(FLASH_LED, LOW);
@@ -645,7 +645,7 @@ Serial.println(" Capturing image...");
     if (isCommandReceived) {
       for (int i = 0; i < 3; i++) { beep(3000, 150); delay(100); } // Beep báo hiệu
 Serial.println(" Capturing image..."); 
-    digitalWrite(FLASH_LED, HIGH); delay(200);
+    digitalWrite(FLASH_LED, HIGH); delay(2000);
     
     camera_fb_t* fb = esp_camera_fb_get(); // Chụp ảnh, lấy dữ liệu vào RAM
     digitalWrite(FLASH_LED, LOW);
@@ -928,43 +928,63 @@ void handleNotFound() {
 void startCaptivePortal() {
   isAPMode = true;
   Serial.println("\n[!] VÀO CHẾ ĐỘ CẤU HÌNH AP");
-  
-  // 1. Tẩy xóa toàn bộ cấu hình WiFi cũ bị kẹt trong ROM
-  WiFi.disconnect(true, true);
-  delay(100);
 
-  // 2. Thiết lập IP tĩnh (BẮT BUỘC để không bị treo IP ở lần thứ 2)
+  // 1. Reset WiFi hoàn toàn
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+
+  // 2. Tắt sleep để tránh rớt WiFi
+  WiFi.setSleep(false);
+
+  // 3. Cấu hình IP tĩnh
   IPAddress apIP(192, 168, 4, 1);
   IPAddress netMsk(255, 255, 255, 0);
 
-  // 3. Khởi động AP với IP tĩnh
+  // 4. Start AP với channel cố định + max connection
   WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(apIP, apIP, netMsk); 
-  WiFi.softAP("ESP32_Water_Meter", "12345678"); 
-  
-  delay(500); // Cho hệ thống mạng 0.5s để ổn định
-  
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+
+  bool result = WiFi.softAP(
+    "ESP32_Water_Meter",
+    "12345678",
+    11,      // 👉 channel cố định (rất quan trọng)
+    0,      // hidden = false
+    4       // max connection
+  );
+
+  if (!result) {
+    Serial.println("❌ Lỗi khởi tạo AP!");
+    return;
+  }
+
+  delay(1000);
+
   Serial.print("AP IP address: ");
   Serial.println(WiFi.softAPIP());
 
-  // 4. Khởi chạy DNS Server để bẻ lái mọi traffic về trang web
+  // 5. DNS captive portal (fix lỗi Android/iOS)
+  dnsServer.stop();
   dnsServer.start(DNS_PORT, "*", apIP);
 
-  // 5. Cấu hình các đường dẫn Web
+  // 6. Web server
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
-  server.onNotFound(handleNotFound); 
+  server.on("/generate_204", handleRoot); // Android
+  server.on("/fwlink", handleRoot);       // Windows
+  server.onNotFound(handleNotFound);
   server.begin();
-  
-  // Hiển thị lên OLED
+
+  // OLED hiển thị
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);
-  u8g2.drawStr(5, 20, "Access Point Mode:");
+  u8g2.drawStr(5, 20, "AP MODE:");
   u8g2.drawStr(5, 40, "ESP32_Water_Meter");
-  u8g2.drawStr(5, 60, "IP: 192.168.4.1");
+  u8g2.drawStr(5, 60, "192.168.4.1");
   u8g2.sendBuffer();
 }
 void setup() { 
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   // 1. MỞ SERIAL VÀ I2C ĐẦU TIÊN (Cho OLED và RTC)
   Serial.begin(115200);
   Wire.begin(5,6); // Dùng chân 5, 6 cho OLED và PCF8563
@@ -1092,7 +1112,7 @@ void loop() {
   if (isAPMode) {
     dnsServer.processNextRequest(); // Phản hồi DNS cho Captive Portal
     server.handleClient();          // Phản hồi HTTP
-    delay(10);                      // Nhường CPU cho các tác vụ nền của WiFi
+    delay(50);                      // Nhường CPU cho các tác vụ nền của WiFi
   } else {
     vTaskDelete(NULL); 
   }
