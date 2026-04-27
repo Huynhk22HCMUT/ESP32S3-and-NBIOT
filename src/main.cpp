@@ -26,6 +26,7 @@ String mqtt_client_id = "";
 String mqtt_username = "";
 String mqtt_password = "";
 String mqtt_topic = "";
+String mqtt_telemetry_topic = "";
 String mqtt_cmd_topic = "";
 bool isAPMode = false;
 SemaphoreHandle_t i2cMutex;
@@ -561,6 +562,44 @@ void goToDeepSleep(uint32_t sleepSeconds) {
   Serial.flush();
   esp_deep_sleep_start();
 }
+// ================== GỬI TELEMETRY (TRẠNG THÁI THIẾT BỊ) ==================
+bool sendTelemetry() {
+  Serial.println(" Gửi thông tin trạng thái (Telemetry)...");
+  
+  // 1. Kiểm tra nguồn cấp (USB hay Battery)
+  float usbVoltage = readUSBVoltage();
+  String powerSource = (usbVoltage > 3.0) ? "usb" : "battery";
+  
+  // 2. Đọc điện áp pin và tính phần trăm
+  float v_bat = readBatteryVoltage();
+  int bat_percent = voltageToPercent(v_bat);
+  
+  // 3. Tạo chuỗi JSON
+  // Định dạng: {"device_id":"abc", "power_source":"usb", "battery": 85}
+  String json = "{\"device_id\":\"" + mqtt_client_id + "\", \"power_source\":\"" + powerSource + "\", \"battery\":" + String(bat_percent) + "}";
+  
+  Serial.println(" Payload Telemetry: " + json);
+
+  // 4. Chuyển JSON sang chuỗi HEX để gửi qua lệnh AT của SIM7020G
+  String hexJson;
+  const char hexChars[] = "0123456789ABCDEF"; 
+  for (size_t j = 0; j < json.length(); j++) { 
+    uint8_t c = json[j]; 
+    hexJson += hexChars[c >> 4]; 
+    hexJson += hexChars[c & 0xF]; 
+  }
+  
+  // 5. Gửi lên Topic Telemetry
+  String cmd = String("AT+CMQPUB=0,\"") + mqtt_telemetry_topic + "\",0,0,0," + String(json.length() * 2) + ",\"" + hexJson + "\""; 
+  String resp = sendAT(cmd, 6000);
+  
+  if (resp.indexOf("OK") != -1 && resp.indexOf("+CMQPUB:") == -1) {
+    Serial.println(" [OK] Đã gửi Telemetry thành công.");
+    return true;
+  }
+  Serial.println(" [LỖI] Gửi Telemetry thất bại.");
+  return false;
+}
 void MainTask(void *pvParameters) {
   uint32_t currentEpoch = getEpoch();
 
@@ -608,7 +647,7 @@ Serial.println(" Capturing image...");
       Serial.println(" [OK] Đã gửi ảnh xong và giải phóng RAM.");
     }
     Serial.println(" [OK] Đã gửi ảnh định kì.");
-
+    sendTelemetry();
     isAdminCheckPhase = true; // Đánh dấu lần thức sau là để Check lệnh
     
     uint32_t sleepSeconds = 2 * 60; // YÊU CẦU: Ngủ đúng 4 phút rồi dậy check
@@ -667,6 +706,7 @@ Serial.println(" Capturing image...");
       Serial.println(" [OK] Đã gửi ảnh xong và giải phóng RAM.");
     }
       Serial.println(" [OK] Đã gửi ảnh theo lệnh Admin.");
+      sendTelemetry();
     } else {
       Serial.println(" Không có lệnh nào được yêu cầu.");
     }
@@ -696,6 +736,7 @@ void loadConfig() {
   mqtt_username = preferences.getString("username", "");
   mqtt_password = preferences.getString("password", "");
   mqtt_topic = preferences.getString("topic", "");
+  mqtt_telemetry_topic = preferences.getString("tele_topic", "");
   mqtt_cmd_topic = preferences.getString("cmd_topic", ""); // THÊM DÒNG NÀY
   preferences.end();
 }
@@ -863,6 +904,11 @@ const char* html_page = R"rawliteral(
       </div>
 
       <div class="form-group">
+        <label>Topic Telemetry (Pin/Nguồn):</label>
+        <input type="text" name="tele_topic" value="%s" placeholder="Ví dụ: watermeter/telemetry" required>
+      </div>
+
+      <div class="form-group">
         <label>Topic Nhận Lệnh:</label>
         <input type="text" name="cmd_topic" value="%s" placeholder="Ví dụ: watermeter/cmd" required>
       </div>
@@ -895,6 +941,7 @@ void handleRoot() {
            mqtt_username.c_str(), 
            mqtt_password.c_str(), 
            mqtt_topic.c_str(),
+           mqtt_telemetry_topic.c_str(),
            mqtt_cmd_topic.c_str());
            
   server.send(200, "text/html; charset=UTF-8", buffer);
@@ -910,6 +957,7 @@ void handleSave() {
     preferences.putString("username", server.arg("username"));
     preferences.putString("password", server.arg("password"));
     preferences.putString("topic", server.arg("topic"));
+    preferences.putString("tele_topic", server.arg("tele_topic"));
     preferences.putString("cmd_topic", server.arg("cmd_topic"));
     preferences.end();
     
